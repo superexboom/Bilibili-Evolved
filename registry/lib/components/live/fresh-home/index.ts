@@ -9,29 +9,89 @@ const liveHome = /^https:\/\/live\.bilibili\.com\/(index\.html)?([?#].*)?$/
 const isLiveHome = () => liveHome.test(window.location.href)
 const root = document.documentElement
 
+/** 本组件生效中 (在直播首页, 且没有被关闭 / 跳到站内其他页面) */
+const isActive = () => isLiveHome() && !root.classList.contains('lfh-off')
+/** 原页面播放器的拉流请求: 取流地址接口 + 直播流本身 */
+const streamPattern = /\/getRoomPlayInfo\?|\/live-bvc\/|\.m3u8(\?|$)|\.flv(\?|$)/
+const isStreamUrl = (input: unknown) => {
+  if (typeof input === 'string') {
+    return streamPattern.test(input)
+  }
+  if (input instanceof URL) {
+    return streamPattern.test(input.href)
+  }
+  const url = (input as Request | null)?.url
+  return typeof url === 'string' && streamPattern.test(url)
+}
+
 /**
- * 原页面已被隐藏, 但其中的直播间预览仍可能自动播放 (旧版首页大屏 / 新版卡片悬停预览).
- * 这里一律静音并暂停, 取代原来的「直播首页静音」/「直播首页暂停」组件.
+ * 新版首页即使隐藏了主体, 原页面的大屏播放器 (main-player) 仍会在后台取流并带声音播放.
+ * 这里从源头拦截: 不让它拿到直播流地址 (省带宽), 再兜底拦住任何不属于本组件的播放.
+ * 取代原来的「直播首页静音」/「直播首页暂停」组件.
  */
-const silenceOriginal = () => {
-  const isOriginal = (el: Element) => Boolean(el.closest('.v2-main-scroll > main'))
-  const silence = (video: HTMLVideoElement) => {
-    video.muted = true
-    video.pause()
+const blockOriginalPlayer = () => {
+  const pageWindow = unsafeWindow
+  const blockedResponse = () =>
+    new pageWindow.Response(
+      JSON.stringify({ code: -1, message: '清爽直播首页: 已拦截首页预览拉流', data: null }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )
+
+  const originalFetch = pageWindow.fetch
+  pageWindow.fetch = function fetch(input: RequestInfo | URL, init?: RequestInit) {
+    if (isActive() && isStreamUrl(input)) {
+      return pageWindow.Promise.resolve(blockedResponse())
+    }
+    return originalFetch.call(pageWindow, input, init)
+  }
+
+  const xhrProto = pageWindow.XMLHttpRequest.prototype
+  const originalOpen = xhrProto.open
+  const originalSend = xhrProto.send
+  const blockedXhrs = new WeakSet<XMLHttpRequest>()
+  xhrProto.open = function open(this: XMLHttpRequest, ...args: unknown[]) {
+    if (isActive() && isStreamUrl(args[1])) {
+      blockedXhrs.add(this)
+    } else {
+      blockedXhrs.delete(this)
+    }
+    return (originalOpen as (...a: unknown[]) => void).apply(this, args)
+  } as typeof xhrProto.open
+  xhrProto.send = function send(this: XMLHttpRequest, body?: Document | XMLHttpRequestBodyInit) {
+    if (blockedXhrs.has(this)) {
+      this.abort()
+      return
+    }
+    originalSend.call(this, body)
+  }
+
+  // 兜底: 首页上本组件自身不含视频, 任何其他视频的播放都静音并拒绝
+  const isOwn = (el: Element) => Boolean(el.closest('.lfh'))
+  const mediaProto = pageWindow.HTMLMediaElement.prototype
+  const originalPlay = mediaProto.play
+  mediaProto.play = function play(this: HTMLMediaElement) {
+    if (isActive() && !isOwn(this)) {
+      this.muted = true
+      this.autoplay = false
+      return pageWindow.Promise.resolve()
+    }
+    return originalPlay.call(this)
   }
   document.addEventListener(
     'play',
     e => {
-      const video = e.target as HTMLVideoElement
-      if (video instanceof HTMLVideoElement && isOriginal(video) && isLiveHome()) {
-        silence(video)
+      const media = e.target
+      if (media instanceof HTMLMediaElement && isActive() && !isOwn(media)) {
+        media.muted = true
+        media.pause()
       }
     },
     true,
   )
-  document.querySelectorAll('video').forEach(video => {
-    if (isOriginal(video)) {
-      silence(video)
+  document.querySelectorAll('video, audio').forEach((media: HTMLMediaElement) => {
+    if (!isOwn(media)) {
+      media.muted = true
+      media.pause()
     }
   })
 }
@@ -64,6 +124,8 @@ export const component = defineComponentMetadata({
     link: 'https://github.com/superexboom',
   },
   entry: async () => {
+    // 必须最先执行: 赶在原页面播放器取流之前装好拦截
+    blockOriginalPlayer()
     addComponentListener(
       `${name}.hideAreaNav`,
       (hide: boolean) => {
@@ -71,7 +133,6 @@ export const component = defineComponentMetadata({
       },
       true,
     )
-    silenceOriginal()
     const scroll = await select<HTMLElement>('.v2-main-scroll')
     if (!scroll) {
       // 页面结构变了: 放弃替换, 恢复原页面
