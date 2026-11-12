@@ -1,0 +1,14 @@
+// 新版直播首页 (Vue 3 + 原子化 class), 没有稳定的语义 class, 选择器尽量依赖结构而非样式类
+
+// 顶栏下方整行的分区导航 (娱乐 / 虚拟主播 / 游戏 ...)
+html:not(.lfh-show-area-nav):not(.lfh-off) #app div:has(> nav.z-20) {
+  display: none !important;
+}
+// 原首页内容: 滚动 banner, 关注头像条, 四张大卡片, 无限滚动推荐
+html:not(.lfh-failed):not(.lfh-off) .v2-main-scroll > main {
+  display: none !important;
+}
+// 推荐流配套的悬浮按钮
+html:not(.lfh-failed):not(.lfh-off) .v2-main-scroll + .fixed {
+  display: none !important;
+}
