@@ -1,0 +1,10 @@
+// 直播间右侧弹幕列表默认保留 300 条. 每来一批消息直播间都会加一条删一条, 再读一次 scrollHeight 滚到底部,
+// 浏览器只好当场把整个列表重新排版 (热门直播间每次约 100 ms, 主线程约两成时间耗在这里).
+// 隐藏的条目不参与排版, 平时只显示最近 N 条; 往上翻看时 (be-live-chat-reading) 恢复完整列表.
+@each $limit in 50, 100 {
+  html.be-live-chat-lite.be-live-chat-limit-#{$limit}:not(.be-live-chat-reading)
+    .chat-history-list
+    .chat-item:nth-last-child(n + #{$limit + 1}) {
+    display: none !important;
+  }
+}
