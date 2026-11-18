@@ -22,7 +22,7 @@ const options = defineOptionsMetadata({
     defaultValue: true,
   },
   autoRecover: {
-    displayName: '直播持续卡顿时自动切换备用节点',
+    displayName: '直播断流时自动切换备用节点',
     defaultValue: true,
   },
   refreshMinutes: {

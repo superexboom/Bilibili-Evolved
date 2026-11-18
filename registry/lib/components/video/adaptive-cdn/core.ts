@@ -1,11 +1,12 @@
-// @ts-nocheck
 /* eslint-disable */
+// @ts-nocheck
 /**
  * 视频与直播 CDN 自动优选 - 核心逻辑
  * 源自浏览器中安装的 v1.0.0 单文件版本 (见 EVO/archive/adaptiveMediaCdn-v1.0.0-installed.js), 保持原有紧凑写法.
  */
+import { createPlaybackStats } from './stats';
 const NAME = 'adaptiveMediaCdn';
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 /** 只在真正播放视频 / 直播的页面上挂钩和测速; 首页、搜索页等的悬停预览不值得为之测速 */
 const playbackPages = [
   /^https:\/\/www\.bilibili\.com\/(video|bangumi\/play|list|festival|medialist\/play|cheese\/play)\//,
@@ -21,6 +22,10 @@ const WARMUP_MAX = 20000;
 const SLOT = '__biliAdaptiveCdn';
 const TTL = 30 * 60 * 1000;
 const COOLDOWN = 120000;
+/** 直播节点测速失败后多久内不再重测 (原来失败的直播节点每次都会重测, 主播断流时会连续测出一串 404) */
+const FAIL_RETRY = 5 * 60 * 1000;
+/** 播放器自己换了线路后, 这么久之内不再把它拉回插件选的节点 */
+const PIN_TTL = 10 * 60 * 1000;
 const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_GROUPS = 80;
 const domains = ['bilivideo.com', 'bilivideo.cn'];
@@ -35,7 +40,8 @@ function mediaUrl(value) {
   } catch { return null; }
 }
 function officialUrl(value) {try {const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password?u:null;}catch{return null;}}
-function mediaIdentity(value) {const u=officialUrl(value);return u?u.pathname.replace(/^\/v1\/resource(?=\/)/,''):'';}
+// 媒体身份: 去掉 PCDN 的 /v1/resource 前缀; 直播流路径里 /live-bvc/<数字>/ 这段每次请求播放地址都会变, 同一路流要去掉它才认得出来
+function mediaIdentity(value) {const u=officialUrl(value);return u?u.pathname.replace(/^\/v1\/resource(?=\/)/,'').replace(/^\/live-bvc\/\d+\//,'/live-bvc/'):'';}
 function hosts(text) {
   const result = [];
   for (let entry of String(text || '').split(/[\s,;]+/)) {
@@ -98,7 +104,7 @@ function groupsOf(json) {
   }
   visit(json,'root',0); return out;
 }
-const groupId = g => [g.kind,g.format,g.codec,g.quality,g.track,new URL(g.urls[0]).pathname].join('|');
+const groupId = g => [g.kind,g.format,g.codec,g.quality,g.track,mediaIdentity(g.urls[0])].join('|');
 // 点播的吞吐只取决于节点, 与编码 / 清晰度无关: 按节点记录, 避免同一节点按每种编码重复测速.
 // 直播 FLV / HLS 的取流路径不同, 仍按格式区分.
 const metricKey = (g,u) => (g.kind==='video'?[g.kind,g.format,new URL(u).host]:[g.kind,g.format,g.codec,new URL(u).host]).join('|');
@@ -145,10 +151,13 @@ function boot(core) {
   for(const legacyKey of ['_state','showButton'])if(legacyKey in opts)delete opts[legacyKey];
   const metrics=store.metrics||{}, catalog=store.catalog||{};
   let stopped=false, busy=false, refreshBusy=false, lastRefresh=Date.now(), lastRecovery=Date.now(), probeCount=0;
-  let pending=false, currentVideo=null, lastSample=null, stallSeconds=0, lastWait=0, involuntaryPause=false;
+  let pending=false, currentVideo=null, lastSample=null;
   let remoteLists={video:[],live:[]}, lastPersist=0;
   const bootAt=Date.now();
+  const stats=createPlaybackStats({W,kind:storageKind,name:NAME,storage});
   const groups=new Map(), mediaMap=new Map(), pathMap=new Map(), knownSourceHosts=new Set(), chosen=new Map(), endpoints=new Map();
+  // 直播: 播放器上一次请求的线路, 以及播放器自己换过去、暂时不接管的线路
+  const playerLast=new Map(), pinned=new Map(), routedHosts=new Map();
   let lastMediaHost="";
   const samples=[], events=[], logs=[], controllers=new Set(), subscriptions=[];
   const cfg=()=>Object.assign({},defaults,opts);
@@ -170,9 +179,15 @@ function boot(core) {
     for(const url of [...clean.urls,...clean.originalUrls]) {
       mediaMap.set(url,id);knownSourceHosts.add(new URL(url).host);pathMap.set(mediaIdentity(url),id); const h=new URL(url).host;catalog[g.kind+'|'+h]={kind:g.kind,host:h,seen:Date.now()};
     }
-    if(groups.size>MAX_GROUPS){const first=groups.keys().next().value;groups.delete(first);for(const[u,id]of mediaMap)if(id===first)mediaMap.delete(u);chosen.delete(first);for(const[p,id]of pathMap)if(id===first)pathMap.delete(p);}
+    if(groups.size>MAX_GROUPS)dropGroup(groups.keys().next().value);
     if(!old || clean.urls.some(u=>!metrics[metricKey(g,u)])) schedule();
   }
+  function dropGroup(id){groups.delete(id);chosen.delete(id);pinned.delete(id);playerLast.delete(id);routedHosts.delete(id);
+    for(const[u,x]of mediaMap)if(x===id)mediaMap.delete(u);for(const[p,x]of pathMap)if(x===id)pathMap.delete(p);}
+  const livePlayingPath=()=>{try{return mediaIdentity(W.livePlayer.getPlayerInfo().playurl);}catch{return '';}};
+  /** 主播重新推流后旧的流地址会 404; 只保留最新返回的和正在播放的直播流, 免得对着失效地址反复测速、把节点误判成失败 */
+  function pruneLive(keep){const current=livePlayingPath();
+    for(const[id,g]of [...groups])if(g.kind==='live'&&!keep.has(id)&&!g.urls.some(u=>mediaIdentity(u)===current))dropGroup(id);}
   function choose(g) {
     const list=rank(g,metrics,g.kind==='live'?[...hosts(cfg().liveHosts),...remoteLists.live]:[]);
     const id=groupId(g), previous=chosen.get(id), best=list[0];
@@ -183,10 +198,15 @@ function boot(core) {
     if(!previous||previous.host!==new URL(winner.url).host)chosen.set(id,{host:new URL(winner.url).host,at:Date.now()});
     return [winner.url,...list.filter(x=>x.url!==winner.url).map(x=>x.url)];
   }
-  function transform(json,url='') {
+  function transform(json,url='',fromPlugin=false) {
     if(stopped||!setting.enabled||!json||typeof json!=='object'||(typeof json.code==='number'&&json.code!==0))return json;
     if(url) {try {const u=new URL(url,W.location.href);if(apiKind(u.href))endpoints.set(apiKind(u.href),u.href);}catch{}}
-    for(const g of groupsOf(json)){remember(g);if(enabled(g.kind)){const ordered=choose(groups.get(groupId(g))||g);const verified=ordered[0]&&metrics[metricKey(g,ordered[0])];if(verified?.ok&&Date.now()-verified.at<TTL)g.apply(ordered);}} 
+    const liveIds=new Set();
+    for(const g of groupsOf(json)){remember(g);const id=groupId(g);
+      // 播放器拿到新的播放地址后会从第一条线路重新开始, 不算它自己换线
+      if(g.kind==='live'){liveIds.add(id);if(!fromPlugin)playerLast.delete(id);}
+      if(enabled(g.kind)){const ordered=choose(groups.get(id)||g);const verified=ordered[0]&&metrics[metricKey(g,ordered[0])];if(verified?.ok&&Date.now()-verified.at<TTL)g.apply(ordered);}}
+    if(liveIds.size)pruneLive(liveIds);
     return json;
   }
   function apiKind(url) {
@@ -201,9 +221,16 @@ function boot(core) {
     const identity=mediaIdentity(url);
     const id=mediaMap.get(url)||((hostAllowed(parsed.hostname)||knownSourceHosts.has(parsed.host)||mediaPath(identity))?pathMap.get(identity):null),g=groups.get(id);
     if(!g||!enabled(g.kind))return url;
+    if(g.kind==='live'){
+      // 播放器自己换了线路 (原线路出错, 或者用户在播放器里手动选了线路) 时按它的选择, 不再把请求拉回插件选的节点
+      const previous=playerLast.get(id);playerLast.set(id,parsed.host);
+      if(previous&&previous!==parsed.host){pinned.set(id,{host:parsed.host,at:Date.now()});log('播放器自行切换了线路，按播放器的选择',{kind:'live',from:previous,to:parsed.host});}
+      const pin=pinned.get(id);if(pin&&pin.host===parsed.host&&Date.now()-pin.at<PIN_TTL){lastMediaHost=parsed.host;return url;}
+    }
     const first=choose(g)[0]; const m=first&&metrics[metricKey(g,first)];
     const result=m?.ok && Date.now()-m.at<TTL && (g.kind!=='live'||g.format!=='flv'||m.sustained)&&alive(first)?first:url;
-    const nextHost=new URL(result).host;if(result!==url&&nextHost!==lastMediaHost)log('实际媒体线路已优选',{kind:g.kind,from:new URL(url).host,to:nextHost});
+    // 按分组记住改走的节点, 只在变化时记日志 (原来音视频分片交替请求时每个分片都会记一条, 把其它日志挤掉)
+    const nextHost=new URL(result).host;if(result!==url&&routedHosts.get(id)!==nextHost){routedHosts.set(id,nextHost);log('实际媒体线路已优选',{kind:g.kind,from:new URL(url).host,to:nextHost});}
     lastMediaHost=nextHost;return result;
   }
   const inputUrl=input=>typeof input==='string'?input:input?.url||input?.href||String(input);
@@ -215,21 +242,37 @@ function boot(core) {
       clone:{configurable:true,value:()=>wrapResponse(clone(),url)}
     });} catch(e){log('响应无法挂钩',{error:e.message});}return response;
   }
+  const mediaGroup=url=>groups.get(mediaMap.get(url)||pathMap.get(mediaIdentity(url)));
+  const isMediaRequest=url=>Boolean(mediaGroup(url))||mediaPath(mediaIdentity(url));
+  const mediaCodec=g=>g&&g.track!=='audio'?g.codec:undefined;
+  const hostOf=url=>{try{return new URL(url,W.location.href).host;}catch{return '';}};
+  /** 播放统计: 用透传的 TransformStream 数一数媒体数据什么时候到、到了多少, 内容原样交给播放器 */
+  function meter(r,used,url){
+    if(!r?.body||!r.ok)return r;
+    // 直播的播放地址可能比流先到也可能后到, 编码在收到数据时再按分组查
+    const host=hostOf(used);let codec;
+    try {const counted=r.body.pipeThrough(new W.TransformStream({transform(chunk,c){codec??=mediaCodec(mediaGroup(url));stats.noteBytes(chunk.byteLength,host,codec);c.enqueue(chunk);}}));
+      const out=new W.Response(counted,{status:r.status,statusText:r.statusText,headers:r.headers});
+      for(const k of ['url','redirected','type'])Object.defineProperty(out,k,{configurable:true,value:r[k]});
+      return out;} catch {return r;}
+  }
   const hookedFetch=async function(input,init) {
     const url=inputUrl(input),mapped=route(url);
     let target=input;if(mapped!==url)target=typeof input==='string'||input instanceof W.URL?mapped:new W.Request(mapped,input);
-    let r;
+    let r,used=mapped;
     try {r=await rawFetch(target,init);if(mapped!==url&&!r.ok)throw Error('HTTP '+r.status);}
     catch(e){if(mapped===url || init?.signal?.aborted || input?.signal?.aborted)throw e;
-      markFailure(groups.get(mediaMap.get(url)||pathMap.get(mediaIdentity(url))),mapped,'媒体请求失败');r=await rawFetch(input,init);}
-    return apiKind(url)?wrapResponse(r,url):r;
+      markFailure(mediaGroup(url),mapped,'媒体请求失败');used=url;r=await rawFetch(input,init);}
+    if(apiKind(url))return wrapResponse(r,url);
+    return isMediaRequest(url)?meter(r,used,url):r;
   };
   W.fetch=hookedFetch;
   const OriginalXHR=W.XMLHttpRequest;
   class HookedXHR extends OriginalXHR {
-    open(method,url,...args){this.__cdnUrl=String(url);this.__cdnCached=undefined;this.__cdnMapped=route(String(url));
-      if(!this.__cdnListening&&this.addEventListener){this.__cdnListening=true;const fail=()=>{if(this.__cdnMapped!==this.__cdnUrl)markFailure(groups.get(mediaMap.get(this.__cdnUrl)||pathMap.get(mediaIdentity(this.__cdnUrl))),this.__cdnMapped,'XHR 媒体请求失败');};
-        this.addEventListener('error',fail);this.addEventListener('load',()=>{if(this.status>=400)fail();});}
+    open(method,url,...args){this.__cdnUrl=String(url);this.__cdnCached=undefined;this.__cdnMapped=route(String(url));this.__cdnMedia=isMediaRequest(this.__cdnUrl);this.__cdnLoaded=0;
+      if(!this.__cdnListening&&this.addEventListener){this.__cdnListening=true;const fail=()=>{if(this.__cdnMapped!==this.__cdnUrl)markFailure(mediaGroup(this.__cdnUrl),this.__cdnMapped,'XHR 媒体请求失败');};
+        this.addEventListener('error',fail);this.addEventListener('load',()=>{if(this.status>=400)fail();});
+        this.addEventListener('progress',e=>{if(!this.__cdnMedia)return;const d=e.loaded-this.__cdnLoaded;this.__cdnLoaded=e.loaded;stats.noteBytes(d,hostOf(this.__cdnMapped),mediaCodec(mediaGroup(this.__cdnUrl)));});}
       return super.open(method,this.__cdnMapped,...args);}
     get responseText(){const s=super.responseText;if(this.readyState!==4||!apiKind(this.__cdnUrl))return s;
       if(this.__cdnCached===undefined){try{this.__cdnCached=JSON.stringify(transform(JSON.parse(s),this.__cdnUrl));}catch{this.__cdnCached=s;}}return this.__cdnCached;}
@@ -283,7 +326,7 @@ function boot(core) {
         if(!warmAt&&now-first>=1000){warmAt=now;warmBytes=bytes;}
         if(warmAt&&now-warmAt>=4500)break;
       }
-    }catch(e){if(e.name!=='AbortError'||!warmAt)throw e;}
+    }catch(e){if(e.name==='AbortError'&&!warmAt&&!stopped)throw Error('7.5 秒内没有持续收到直播数据');if(e.name!=='AbortError'||!warmAt)throw e;}
     finally{clearTimeout(timer);try{await reader?.cancel();}catch{}controller.abort();controllers.delete(controller);}
     const now=performance.now();gap=Math.max(gap,last?now-last:0);
     const duration=now-warmAt;if(ended||bytes<65536||!warmAt||duration<2000||bytes-warmBytes<65536)throw Error('持续直播数据不足或提前断流');
@@ -313,10 +356,13 @@ function boot(core) {
   async function runTests(force=false) {
     if(busy||stopped)return {busy:true};busy=true;render();let tested=0;
     try {
-      const relevant=[...groups.values()].filter(g=>enabled(g.kind));
-      const current=W.livePlayer?.getPlayerInfo?.().playurl;
+      let relevant=[...groups.values()].filter(g=>enabled(g.kind));
+      const current=W.livePlayer?.getPlayerInfo?.().playurl,currentPath=livePlayingPath();
+      // 直播只测正在播放的这一路流, 各节点的结果才有可比性; 找不到时再测全部
+      const playingLive=relevant.filter(g=>g.kind==='live'&&g.urls.some(u=>mediaIdentity(u)===currentPath));
+      if(playingLive.length)relevant=relevant.filter(g=>g.kind!=='live'||playingLive.includes(g));
       const active=new Set(performance.getEntriesByType('resource').slice(-100).filter(r=>mediaUrl(r.name)).map(r=>new URL(r.name).pathname));
-      const priority=g=>(g.urls.includes(current)?1000:0)+(g.urls.some(u=>active.has(new URL(u).pathname))?100:0)+(g.track==='video'?10:0)+Math.min(9,Number(g.quality||0)/1000);
+      const priority=g=>(g.urls.includes(current)||playingLive.includes(g)?1000:0)+(g.urls.some(u=>active.has(new URL(u).pathname))?100:0)+(g.track==='video'?10:0)+Math.min(9,Number(g.quality||0)/1000);
       relevant.sort((a,b)=>priority(b)-priority(a));
       const seen=new Set();
       for(const g of relevant){
@@ -326,10 +372,12 @@ function boot(core) {
         const extras=g.kind==='video'?[...hosts(cfg().videoHosts),...remoteLists.video,...discovered].map(host=>{const u=new URL(g.urls[0]);u.hostname=host;return u.href;}):[];
         const candidates=[...new Set([...g.urls,...(g.manual||[]),...extras])];
         for(const url of candidates){
-          if(tested>=6||stopped)break;
+          // 正在卡顿时不测速, 免得和播放抢带宽
+          if(tested>=6||stopped||stats.ongoing())break;
           const key=metricKey(g,url);if(seen.has(key)||!alive(url))continue;seen.add(key);
-          const old=metrics[key];if(!force&&old&&Date.now()-old.at<TTL&&(g.kind!=='live'||g.format!=='flv'||old.sustained))continue;
-          tested++;probeCount++;const manual=!g.urls.includes(url);
+          const old=metrics[key],keep=old&&(old.ok||g.kind==='video')?TTL:FAIL_RETRY;
+          if(!force&&old&&Date.now()-old.at<keep&&(!old.ok||g.kind!=='live'||g.format!=='flv'||old.sustained))continue;
+          tested++;probeCount++;const manual=!g.urls.includes(url);stats.probeStart();
           try {
             if(manual&&!reference){const r=await probe(g,g.urls[0]);reference=r.data.slice(0,65536);}
             const r=await probe(g,url,manual?reference:null);
@@ -338,6 +386,7 @@ function boot(core) {
             if(manual){g.urls.push(url);mediaMap.set(url,g.id);}
             log('测速通过',{kind:g.kind,host:new URL(url).host,mbps:+r.mbps.toFixed(2),ttfb:Math.round(r.ttfb)});
           }catch(e){if(stopped)break;markFailure(g,url,e.message);log('节点测试失败',{kind:g.kind,host:new URL(url).host,error:e.message});}
+          finally{stats.probeEnd();}
         }
       }
       persist();
@@ -361,9 +410,11 @@ function boot(core) {
       const kind=W.location.hostname==='live.bilibili.com'?'live':'video';let api=endpoints.get(kind);
       if(!api&&kind==='live'){
         const room=W.location.pathname.match(/(?:blanc\/)?(\d+)/)?.[1];
-        if(room)api='https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id='+room+'&protocol=0,1&format=0,1,2&codec=0,1,2&qn=25000&platform=web';
+        // 按播放器当前的清晰度取, 测到的才是正在看的那一路流
+        const qn=Number(W.livePlayer?.getPlayerInfo?.().quality)||10000;
+        if(room)api='https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id='+room+'&protocol=0,1&format=0,1,2&codec=0,1,2&qn='+qn+'&platform=web';
       }
-      if(api){const r=await rawFetch(api,{credentials:'include',signal:AbortSignal.timeout(6000)});const data=await r.json();if(data.code!==0)throw Error('播放接口返回 '+data.code);transform(data,api);}
+      if(api){const r=await rawFetch(api,{credentials:'include',signal:AbortSignal.timeout(6000)});const data=await r.json();if(data.code!==0)throw Error('播放接口返回 '+data.code);transform(data,api,true);}
       else if(W.__playinfo__)transform(W.__playinfo__);
       else log('等待播放器返回官方播放地址');
       lastRefresh=Date.now();log('候选列表已更新',{count:Object.keys(catalog).length});persist();
@@ -371,36 +422,51 @@ function boot(core) {
     finally{refreshBusy=false;render();}
     if(test)return runTests(true);return {ok:true};
   }
-  function currentHost(){try{if(lastMediaHost)return lastMediaHost;const live=W.livePlayer?.getPlayerInfo?.().playurl;if(live)return new URL(live).host;
+  function currentHost(){try{const active=stats.activeHost();if(active)return active;if(lastMediaHost)return lastMediaHost;const live=W.livePlayer?.getPlayerInfo?.().playurl;if(live)return new URL(live).host;
     const source=W.player?.getMediaInfo?.().playUrl;return source?new URL(source).host:'';}catch{return '';}}
   function snapshot(){return {version:VERSION,time:new Date().toISOString(),page:W.location.origin+W.location.pathname,
     config:Object.fromEntries(Object.entries(cfg()).filter(([k])=>!k.startsWith('_')&&k!=='listSources')),
-    currentHost:currentHost(),metrics,catalog,samples:[...samples],events:[...events],logs:[...logs],probeCount,
+    currentHost:currentHost(),stats:stats.summary(),metrics,catalog,samples:[...samples],events:[...events],logs:[...logs],probeCount,
     groups:[...groups.values()].map(g=>({kind:g.kind,format:g.format,codec:g.codec,quality:g.quality,hosts:[...new Set(g.urls.map(u=>new URL(u).host))]}))};}
   function download(name,content){const blob=new Blob([content],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}
   function bestVideoHost(){for(const g of groups.values()){if(g.kind!=='video'||g.track!=='video')continue;const first=choose(g)[0];const m=first&&metrics[metricKey(g,first)];if(m?.ok&&Date.now()-m.at<TTL)return new URL(first).host;}return '';}
-  function applyNow(){
-    chosen.clear();
-    if(W.livePlayer?.reload){lastRecovery=Date.now();log('应用优选线路，重载直播播放器');W.livePlayer.reload();return;}
+  function applyNow(reason='手动应用优选'){
+    chosen.clear();pinned.clear();playerLast.clear();
+    if(W.livePlayer?.reload){lastRecovery=Date.now();stats.noteReload('cdn',reason);log('应用优选线路，重载直播播放器');W.livePlayer.reload();return;}
     // 点播的每个分片请求都会经过 route(), 清掉切换冷却后, 后续分片立即改走当前最优节点, 不需要刷新页面
     const host=bestVideoHost();log(host?'已切换，后续分片改走 '+host:'还没有可用的测速结果，请先刷新列表并测速');
   }
   function sample(){
     if(stopped)return;const v=document.querySelector('video');if(!v)return;
     if(v!==currentVideo){currentVideo=v;
-      for(const type of ['waiting','stalled','playing','pause','error']){const fn=()=>{if(type==='waiting'||type==='stalled')lastWait=Date.now();if(type==='pause')involuntaryPause=Date.now()-lastWait<1600;if(type==='playing')involuntaryPause=false;events.push({at:Date.now(),type,time:v.currentTime});if(events.length>180)events.shift();};v.addEventListener(type,fn);subscriptions.push(()=>v.removeEventListener(type,fn));}
+      for(const type of ['waiting','stalled','playing','pause','error','emptied']){const fn=()=>{events.push({at:Date.now(),type,time:v.currentTime});if(events.length>180)events.shift();};v.addEventListener(type,fn);subscriptions.push(()=>v.removeEventListener(type,fn));}
     }
     const quality=v.getVideoPlaybackQuality?.();let buffer=0;for(let i=0;i<v.buffered.length;i++)if(v.currentTime>=v.buffered.start(i)-0.1&&v.currentTime<=v.buffered.end(i)+0.1)buffer=Math.max(0,v.buffered.end(i)-v.currentTime);
+    stats.tick(v,buffer);
     const row={at:Date.now(),time:+v.currentTime.toFixed(3),buffer:+buffer.toFixed(3),paused:v.paused,readyState:v.readyState,rate:v.playbackRate,frames:quality?.totalVideoFrames,dropped:quality?.droppedVideoFrames,host:currentHost()};
-    const genuinelyStalled=lastSample&&(!v.paused||involuntaryPause)&&!v.seeking&&!v.ended&&!document.hidden&&v.currentTime-lastSample.time<0.08&&buffer<0.3&&v.readyState<3;
-    stallSeconds=genuinelyStalled?stallSeconds+1:0;lastSample=row;samples.push(row);if(samples.length>600)samples.shift();
-    const repeatedWaits=events.filter(e=>e.type==='waiting'&&Date.now()-e.at<20000).length>=3 && buffer<1 && (!v.paused||involuntaryPause);
-    if((stallSeconds>=6||repeatedWaits)&&cfg().autoRecover&&enabled('live')&&W.livePlayer?.reload&&Date.now()-lastRecovery>COOLDOWN){
-      const info=W.livePlayer.getPlayerInfo(),g=[...groups.values()].find(g=>g.kind==='live'&&g.urls.some(u=>new URL(u).pathname===new URL(info.playurl).pathname));
-      const better=g&&choose(g).find(u=>new URL(u).host!==row.host&&metrics[metricKey(g,u)]?.ok);
-      if(better){const current=g.urls.find(u=>new URL(u).host===row.host);if(current)markFailure(g,current,'持续缺帧且缓冲耗尽');log('检测到持续卡顿，尝试官方备用节点');applyNow();stallSeconds=0;}
-    }
+    lastSample=row;samples.push(row);if(samples.length>600)samples.shift();
+    recover(row.host);
     if(Date.now()-lastPersist>60000)persist();render();
+  }
+  /**
+   * 直播断流时换节点. 只在确实是节点不送数据时才换: 单次卡顿超过 6 秒且 4 秒没收到数据, 或者 90 秒内 3 次网络断流.
+   * 原来按 waiting 事件计数 (直播播放器每次卡顿会发两次 waiting), 两次 1 秒的小卡顿就会触发整个播放器重载, 重载本身比卡顿更久;
+   * 页面繁忙、播放器自身原因的卡顿换节点也没用.
+   */
+  function recover(host){
+    if(!cfg().autoRecover||!enabled('live')||!W.livePlayer?.reload||Date.now()-lastRecovery<COOLDOWN)return;
+    const stall=stats.ongoing(),dead=Boolean(stall&&stall.elapsed>=6000&&stall.noData>=4000);
+    const flaky=stats.networkStallsSince(Math.max(Date.now()-90000,lastRecovery))>=3;
+    if(!dead&&!flaky)return;
+    const path=livePlayingPath(),g=path?[...groups.values()].find(g=>g.kind==='live'&&g.urls.some(u=>mediaIdentity(u)===path)):null;
+    if(!g)return;
+    const fresh=u=>{const m=metrics[metricKey(g,u)];return m?.ok&&(g.format!=='flv'||m.sustained)&&Date.now()-m.at<TTL;};
+    const better=choose(g).find(u=>new URL(u).host!==host&&fresh(u));
+    const reason=dead?'断流超过 6 秒':'90 秒内 3 次网络断流';
+    lastRecovery=Date.now();
+    if(!better){log('直播'+reason+'，但没有测速通过的备用节点，先重新测速');schedule();return;}
+    const current=g.urls.find(u=>new URL(u).host===host);if(current)markFailure(g,current,reason);
+    log('直播'+reason+'，切到备用节点',{kind:'live',from:host,to:new URL(better).host});applyNow(reason);
   }
   /** 起播保护: 等播放器缓冲够了 (直播要求更低), 或者超时以后, 才开始自动测速, 不和起播抢带宽 */
   function warmedUp(){
@@ -422,7 +488,7 @@ function boot(core) {
         state:expired?'已过期':m.ok?(parts[0]==='live'&&parts[1]==='flv'&&!m.sustained?'待持续复测':'已验证'):m.error||'失败',ok:Boolean(m.ok)&&!expired,
         current:Boolean(s?.host)&&host===s.host};});
     const messages=logs.slice(-3).map(l=>new Date(l.at).toLocaleTimeString()+' '+l.message+(l.host?' '+l.host:'')+(l.mbps!=null?' · '+l.mbps+' Mbps':'')+(l.error?'：'+l.error:'')+(l.to?'：'+l.from+' → '+l.to:''));
-    return {version:VERSION,isLive:storageKind==='live',busy:busy||refreshBusy,status,rows,messages};
+    return {version:VERSION,isLive:storageKind==='live',busy:busy||refreshBusy,status,rows,messages,stats:stats.view()};
   }
   function exportDiagnostic(){download('bilibili-cdn-diagnostic-'+Date.now()+'.json',JSON.stringify(snapshot(),null,2));}
   function exportList(){download('bilibili-cdn-list.json',JSON.stringify({video:[...new Set(Object.values(catalog).filter(x=>x.kind==='video').map(x=>x.host))],live:[...new Set(Object.values(catalog).filter(x=>x.kind==='live').map(x=>x.host))]},null,2));}
@@ -430,9 +496,11 @@ function boot(core) {
   const timer=setInterval(()=>{sample();if(!document.hidden&&!busy&&!refreshBusy){const n=Number(cfg().refreshMinutes);if(n>=5&&Date.now()-lastRefresh>n*60000)refreshLists().catch(()=>{});}},1000);
   const ready=()=>whenWarm(()=>refreshLists(false).then(()=>runTests(false)).catch(()=>{}));
   if(document.body)ready();else document.addEventListener('DOMContentLoaded',ready,{once:true});
-  const api={version:VERSION,transform,refresh:refreshLists,test:runTests,snapshot,apply:applyNow,view,exportDiagnostic,exportList,resetMetrics,
+  const api={version:VERSION,transform,refresh:refreshLists,test:runTests,snapshot,apply:()=>applyNow(),view,exportDiagnostic,exportList,resetMetrics,
+    /** 本页的播放统计 */ stats:()=>stats.summary(),
+    /** 存在脚本存储里的历史统计 (最近的卡顿记录、各节点的卡顿率) */ history:()=>stats.history(),
     subscribe(fn){listeners.add(fn);return ()=>listeners.delete(fn);},
-    stop(){stopped=true;clearInterval(timer);for(const c of controllers)c.abort();for(const off of subscriptions)off();
+    stop(){stopped=true;clearInterval(timer);for(const c of controllers)c.abort();for(const off of subscriptions)off();stats.stop();
       document.removeEventListener('DOMContentLoaded',ready);if(W.fetch===hookedFetch)W.fetch=rawFetch;
       if(W.XMLHttpRequest===HookedXHR)W.XMLHttpRequest=OriginalXHR;for(const restore of restores)restore();persist();render();listeners.clear();delete W[SLOT];}};
   W[SLOT]=api;log('自动优选已启动');return api;

@@ -55,13 +55,39 @@
     <div v-if="view.messages.length" class="adaptive-cdn-log">
       <div v-for="(message, index) of view.messages" :key="index">{{ message }}</div>
     </div>
+    <div v-if="view.stats" class="adaptive-cdn-stats">
+      <div class="adaptive-cdn-stats-title">播放统计</div>
+      <div class="adaptive-cdn-stats-line" title="解码方式、分辨率、实际渲染帧率和掉帧比例">
+        <span>解码</span>{{ view.stats.decode }}
+      </div>
+      <div
+        class="adaptive-cdn-stats-line"
+        title="CPU 压力来自浏览器的 Compute Pressure 接口; 长任务是页面主线程被占住超过 50 ms 的时间"
+      >
+        <span>负载</span>{{ view.stats.load }}
+      </div>
+      <div class="adaptive-cdn-stats-line"><span>卡顿</span>{{ view.stats.summary }}</div>
+      <div
+        v-for="(line, index) of view.stats.recent.concat(view.stats.reloads, view.stats.errors)"
+        :key="index"
+        class="adaptive-cdn-stats-item"
+      >
+        {{ line }}
+      </div>
+      <details v-if="view.stats.hosts.length" class="adaptive-cdn-stats-hosts">
+        <summary>各节点卡顿率 (近 14 天, 观看满 1 分钟的节点)</summary>
+        <div v-for="(line, index) of view.stats.hosts" :key="index" class="adaptive-cdn-stats-item">
+          {{ line }}
+        </div>
+      </details>
+    </div>
     <details class="adaptive-cdn-settings">
       <summary>设置与自定义节点</summary>
       <label><input v-model="draft.autoVideo" type="checkbox" /> 自动优选视频</label>
       <label><input v-model="draft.autoLive" type="checkbox" /> 自动优选直播</label>
       <label>
         <input v-model="draft.autoRecover" type="checkbox" />
-        直播持续卡顿时自动切换备用节点 (至少间隔 2 分钟)
+        直播断流时自动切换备用节点 (单次断流超过 6 秒, 或 90 秒内断流 3 次; 至少间隔 2 分钟)
       </label>
       <label>
         每
@@ -121,6 +147,7 @@ const emptyView = {
   status: '等待播放器',
   rows: [],
   messages: [],
+  stats: null,
 }
 const margin = 8
 let unsubscribe: (() => void) | undefined
@@ -403,6 +430,38 @@ export default Vue.extend({
 .adaptive-cdn-log {
   opacity: 0.7;
   overflow-wrap: anywhere;
+}
+
+.adaptive-cdn-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background-color: #8881;
+  overflow-wrap: anywhere;
+
+  summary {
+    cursor: pointer;
+    user-select: none;
+    opacity: 0.8;
+  }
+}
+
+.adaptive-cdn-stats-title {
+  font-weight: bold;
+}
+
+.adaptive-cdn-stats-line > span {
+  display: inline-block;
+  width: 3em;
+  opacity: 0.6;
+}
+
+.adaptive-cdn-stats-item {
+  padding-left: 3em;
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
 }
 
 .adaptive-cdn-settings {
